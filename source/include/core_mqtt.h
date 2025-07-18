@@ -102,10 +102,13 @@ typedef uint32_t (* MQTTGetCurrentTimeFunc_t )( void );
  * @param[in] pContext Initialized MQTT context.
  * @param[in] pPacketInfo Information on the type of incoming MQTT packet.
  * @param[in] pDeserializedInfo Deserialized information from incoming packet.
+ * @param[in] pAckProperties Properties from the incoming ACK packet (if applicable).
+ *            This parameter will be NULL for MQTT v3.1.1 connections.
  */
 typedef void (* MQTTEventCallback_t )( struct MQTTContext * pContext,
                                        struct MQTTPacketInfo * pPacketInfo,
-                                       struct MQTTDeserializedInfo * pDeserializedInfo );
+                                       struct MQTTDeserializedInfo * pDeserializedInfo,
+                                       struct MQTTAckProperties * pAckProperties );
 
 /**
  * @brief User defined callback used to store outgoing publishes. Used to track any publish
@@ -258,6 +261,16 @@ typedef struct MQTTContext
      * @brief The buffer used in sending and receiving packets from the network.
      */
     MQTTFixedBuffer_t networkBuffer;
+    
+    /**
+     * @brief The buffer used for storing ACK properties for MQTT v5.0.
+     */
+    MQTTFixedBuffer_t * pAckPropsBuffer;
+    
+    /**
+     * @brief MQTT protocol version (3 for v3.1.1 or 5 for v5.0).
+     */
+    uint8_t mqttVersion;
 
     /**
      * @brief The next available ID for outgoing MQTT packets.
@@ -357,6 +370,10 @@ typedef struct MQTTDeserializedInfo
  *     to receive incoming messages from the broker. This buffer must remain valid and in scope
  *     for the entire lifetime of the @p pContext and must not be used by another context and/or
  *     application.
+ * @param[in] pAckPropsBuffer Buffer for storing ACK properties for MQTT v5.0. This parameter
+ *     can be NULL for MQTT v3.1.1 connections. If provided, this buffer will be used to store
+ *     properties for incoming ACK packets. This buffer must remain valid and in scope for the
+ *     entire lifetime of the @p pContext.
  *
  * @return #MQTTBadParameter if invalid parameters are passed;
  * #MQTTSuccess otherwise.
@@ -380,9 +397,11 @@ typedef struct MQTTDeserializedInfo
  * MQTTContext_t mqttContext;
  * TransportInterface_t transport;
  * MQTTFixedBuffer_t fixedBuffer;
+ * MQTTFixedBuffer_t ackPropsBuffer;
  * // Create a globally accessible buffer which remains in scope for the entire duration
  * // of the MQTT context.
  * uint8_t buffer[ 1024 ];
+ * uint8_t ackPropsBufferData[ 128 ];
  *
  * // Clear context.
  * memset( ( void * ) &mqttContext, 0x00, sizeof( MQTTContext_t ) );
@@ -396,13 +415,22 @@ typedef struct MQTTDeserializedInfo
  * fixedBuffer.pBuffer = buffer;
  * fixedBuffer.size = 1024;
  *
- * status = MQTT_Init( &mqttContext, &transport, getTimeStampMs, eventCallback, &fixedBuffer );
+ * // Set ACK properties buffer members (for MQTT v5.0).
+ * ackPropsBuffer.pBuffer = ackPropsBufferData;
+ * ackPropsBuffer.size = 128;
+ *
+ * // For MQTT v3.1.1, pass NULL for the ACK properties buffer.
+ * status = MQTT_Init( &mqttContext, &transport, getTimeStampMs, eventCallback, &fixedBuffer, NULL );
+ *
+ * // For MQTT v5.0, pass the ACK properties buffer.
+ * // status = MQTT_Init( &mqttContext, &transport, getTimeStampMs, eventCallback, &fixedBuffer, &ackPropsBuffer );
  *
  * if( status == MQTTSuccess )
  * {
  *      // Do something with mqttContext. The transport and fixedBuffer structs were
  *      // copied into the context, so the original structs do not need to stay in scope.
- *      // However, the memory pointed to by the fixedBuffer.pBuffer must remain in scope.
+ *      // However, the memory pointed to by the fixedBuffer.pBuffer and ackPropsBuffer.pBuffer
+ *      // (if provided) must remain in scope.
  * }
  * @endcode
  */
@@ -411,7 +439,8 @@ MQTTStatus_t MQTT_Init( MQTTContext_t * pContext,
                         const TransportInterface_t * pTransportInterface,
                         MQTTGetCurrentTimeFunc_t getTimeFunction,
                         MQTTEventCallback_t userCallback,
-                        const MQTTFixedBuffer_t * pNetworkBuffer );
+                        const MQTTFixedBuffer_t * pNetworkBuffer,
+                        const MQTTFixedBuffer_t * pAckPropsBuffer );
 /* @[declare_mqtt_init] */
 
 /**
@@ -712,6 +741,30 @@ MQTTStatus_t MQTT_Connect( MQTTContext_t * pContext,
                            const MQTTPublishInfo_t * pWillInfo,
                            uint32_t timeoutMs,
                            bool * pSessionPresent );
+
+/**
+ * @brief Establish an MQTT session with MQTT v5.0 properties.
+ *
+ * This function is similar to MQTT_Connect but allows specifying MQTT v5.0 properties.
+ *
+ * @param[in] pContext Initialized MQTT context.
+ * @param[in] pConnectInfo MQTT CONNECT packet information.
+ * @param[in] pWillInfo Last Will and Testament. Pass NULL if Last Will and
+ * Testament is not used.
+ * @param[in] timeoutMs Maximum time in milliseconds to wait for a CONNACK packet.
+ * @param[out] pSessionPresent This value will be set to true if a previous session
+ * was present; otherwise it will be set to false.
+ * @param[in] pPropertyBuilder MQTT v5.0 property builder for CONNECT packet properties.
+ * Pass NULL if not using MQTT v5.0 properties.
+ *
+ * @return See MQTT_Connect for return values.
+ */
+MQTTStatus_t MQTT_ConnectV5( MQTTContext_t * pContext,
+                           const MQTTConnectInfo_t * pConnectInfo,
+                           const MQTTPublishInfo_t * pWillInfo,
+                           uint32_t timeoutMs,
+                           bool * pSessionPresent,
+                           const MqttPropBuilder_t * pPropertyBuilder );
 /* @[declare_mqtt_connect] */
 
 /**
@@ -825,6 +878,24 @@ MQTTStatus_t MQTT_Publish( MQTTContext_t * pContext,
                            const MQTTPublishInfo_t * pPublishInfo,
                            uint16_t packetId );
 /* @[declare_mqtt_publish] */
+
+/**
+ * @brief Publish a message to a topic with MQTT v5.0 properties.
+ *
+ * This function is the same as MQTT_Publish, but with an additional parameter
+ * for MQTT v5.0 properties.
+ *
+ * @param[in] pContext Initialized MQTT context.
+ * @param[in] pPublishInfo MQTT PUBLISH packet parameters.
+ * @param[in] packetId Packet identification for the MQTT PUBLISH packet.
+ * @param[in] pPropertyBuilder MQTT v5.0 property builder. Pass NULL if not using MQTT v5.0.
+ *
+ * @return #MQTTSuccess or #MQTTBadParameter.
+ */
+MQTTStatus_t MQTT_PublishV5( MQTTContext_t * pContext,
+                            const MQTTPublishInfo_t * pPublishInfo,
+                            uint16_t packetId,
+                            const MqttPropBuilder_t * pPropertyBuilder );
 
 /**
  * @brief Cancels an outgoing publish callback (only for QoS > QoS0) by
